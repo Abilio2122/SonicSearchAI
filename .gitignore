@@ -1,3 +1,8 @@
 .dist
 SonicSearch/
 
+__pycache__/clap_search.cpython-314.pyc
+__pycache__/judge.cpython-314.pyc
+__pycache__/router.cpython-314.pyc
+__pycache__/semantic_search.cpython-314.pyc
+.env

@@ -19,13 +19,12 @@ independientemente del idioma de la query original.
 import os
 import json
 import requests
+from dotenv import load_dotenv  # Cargar variables de entorno desde .env
 
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
+load_dotenv()  # Carga GROQ_API_KEY y GROQ_MODEL del archivo .env
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CONFIGURACIÓN
+# CONFIGURACIÓN — Plan A: API Key cargada desde archivo .env
 # ──────────────────────────────────────────────────────────────────────────────
 
 PROMPT_URL = (
@@ -35,7 +34,7 @@ PROMPT_URL = (
 )
 PROMPT_CACHE_PATH = "./api_prompt.txt"   # se guarda localmente tras la primera descarga
 
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DESCARGA DEL PROMPT
@@ -115,13 +114,12 @@ def get_router_chain():
     # 1. Cargar el system prompt
     system_prompt = _download_prompt()
 
-    # 2. Verificar API key
-    groq_api_key = os.environ.get("GROQ_API_KEY")
+    # 2. Verificar API key desde .env
+    groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
         raise EnvironmentError(
-            "GROQ_API_KEY no encontrada. "
-            "Ejecuta en CMD:  setx GROQ_API_KEY \"gsk_...\""
-            " y reinicia la terminal."
+            "GROQ_API_KEY no encontrada en .env. "
+            f"Verifica que el archivo {PROMPT_CACHE_PATH} tenga la clave configurada."
         )
 
     # 3. Prompt template

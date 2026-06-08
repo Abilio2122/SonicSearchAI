@@ -1,0 +1,17 @@
+# SonicSearch AI — Requirements
+# Dependencias Python para ejecutar el proyecto
+# 
+# Instalar: pip install -r requirements.txt
+
+flask>=3.0.0           # Servidor web y API REST
+numpy>=1.24.0          # Computación numérica (fusión RRF)
+pandas>=2.0.0          # Procesamiento de datos CSV
+faiss-cpu>=1.7.0       # Búsqueda vectorial acústica (CLAP embeddings)
+
+# LangChain + Groq API
+langchain-groq>=0.1.0  # Cliente oficial para Groq LLMs
+langchain-core>=0.1.0  # Prompts y parsers JSON
+
+# Utilidades adicionales
+requests>=2.31.0       # Descarga de prompts desde Gist
+einops>=0.6.0          # Transformaciones tensoriales (fusión RRF)

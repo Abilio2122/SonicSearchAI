@@ -43,14 +43,19 @@ def _import_clap_search():
     from clap_search import search_audio
     return search_audio
 
+def _import_judge():
+    from judge import evaluate_song
+    return evaluate_song
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
 # ──────────────────────────────────────────────────────────────────────────────
 
-OUTPUT_DIR  = "./output"
-TOP_K       = 10
-FINAL_TOP_K = 5
-RRF_K       = 60
+OUTPUT_DIR       = "./output"
+TOP_K            = 10
+FINAL_TOP_K      = 5
+RRF_K            = 60
+MAX_JUDGE_ITERS  = 3    # máximo de iteraciones del loop de reflexión
 
 app = Flask(__name__)
 
@@ -96,16 +101,22 @@ class SearchEngine:
             traceback.print_exc()
 
     def get_song_by_id(self, song_id: int) -> dict | None:
+        # Verificar que df_meta no sea None antes de usarlo (Python 3.14 compatibility)
+        if self.df_meta is None or not isinstance(self.df_meta, pd.DataFrame):
+            print(f"[ENGINE] ⚠️ df_meta es nulo o inválido para song_id={song_id}")
+            return None
+        
         row = self.df_meta[self.df_meta["song_id"] == song_id]
         if row.empty:
             return None
-        r = row.iloc[0]
+        r = row.iloc[0]  # Obtener la primera fila del resultado
         return {
             "song_id": int(r["song_id"]),
             "title":   str(r.get("title",  "—")),
             "artist":  str(r.get("artist", "—")),
             "tag":     str(r.get("tag",    "—")),
             "year":    str(r.get("year",   "—")),
+            "lyrics":  str(r.get("lyrics", "")),
         }
 
 
@@ -191,6 +202,69 @@ def compute_hybrid_score(
 # ORQUESTADOR PRINCIPAL
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _execute_search(
+    lyric_positive: list,
+    lyric_negative: list,
+    clap_positive:  list,
+    clap_negative:  list,
+    lyric_weight:   float,
+    audio_weight:   float,
+    excluded_ids:   set | None = None,
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]], list[tuple[int, float]]]:
+    """
+    Ejecuta ambas ramas de búsqueda y fusiona con RRF.
+    Devuelve (lyrics_results, audio_results, fused).
+    Si excluded_ids se proporciona, filtra esos song_ids del resultado fusionado.
+    """
+    excluded_ids = excluded_ids or set()
+
+    # ── Rama Lírica ───────────────────────────────────────────────────────
+    lyrics_results = []
+    if lyric_positive:
+        try:
+            search_lyrics  = _import_semantic_search()
+            lyrics_results = search_lyrics(
+                positive=lyric_positive,
+                negative=lyric_negative,
+                top_k=TOP_K,
+            )
+            print(f"[EXEC] Lírica: {len(lyrics_results)} candidatos")
+        except Exception as e:
+            print(f"[EXEC] Búsqueda lírica falló: {e}")
+            traceback.print_exc()
+
+    # ── Rama Acústica ─────────────────────────────────────────────────────
+    audio_results = []
+    if clap_positive:
+        try:
+            search_audio_fn = _import_clap_search()
+            audio_results   = search_audio_fn(
+                positive=clap_positive,
+                negative=clap_negative,
+                top_k=TOP_K,
+            )
+            print(f"[EXEC] Audio: {len(audio_results)} candidatos")
+        except Exception as e:
+            print(f"[EXEC] Búsqueda acústica falló: {e}")
+
+    # ── Fusión ────────────────────────────────────────────────────────────
+    if not lyrics_results and not audio_results:
+        return lyrics_results, audio_results, []
+
+    fused = compute_hybrid_score(
+        lyrics_results,
+        audio_results,
+        lyric_weight=lyric_weight,
+        audio_weight=audio_weight,
+    )
+
+    # Filtrar excluidos
+    if excluded_ids:
+        fused = [(sid, sc) for sid, sc in fused if sid not in excluded_ids]
+
+    return lyrics_results, audio_results, fused
+
+
 def get_top_k_results(query: str, k: int = FINAL_TOP_K) -> dict:
     if not engine.ready:
         return {"error": f"Motor no inicializado: {engine.error}"}
@@ -228,66 +302,112 @@ def get_top_k_results(query: str, k: int = FINAL_TOP_K) -> dict:
         audio_weight   = 0.3
         plan           = {"_fallback": str(e)}
 
-    # ── EXEC: Rama Lírica ─────────────────────────────────────────────────────
-    lyrics_results = []
-    if lyric_positive:
-        try:
-            search_lyrics  = _import_semantic_search()
-            lyrics_results = search_lyrics(
-                positive=lyric_positive,   # lista de strings
-                negative=lyric_negative,   # lista de strings
-                top_k=TOP_K,
-            )
-            print(f"[EXEC] Lírica: {len(lyrics_results)} candidatos")
-        except Exception as e:
-            print(f"[EXEC] Búsqueda lírica falló: {e}")
-            traceback.print_exc()
+    # ── BÚSQUEDA + LOOP DE REFLEXIÓN CON JUEZ ─────────────────────────────────
+    judge_fn       = _import_judge()
+    excluded_ids   = set()
+    judge_log      = []       # historial de veredictos
+    final_verdict  = None
+    approved_song  = None
 
-    # ── EXEC: Rama Acústica ───────────────────────────────────────────────────
-    audio_results = []
-    if clap_positive:
-        try:
-            search_audio_fn = _import_clap_search()
-            audio_results   = search_audio_fn(
-                positive=clap_positive,    # lista de strings
-                negative=clap_negative,    # lista de strings
-                top_k=TOP_K,
-            )
-            print(f"[EXEC] Audio: {len(audio_results)} candidatos")
-        except Exception as e:
-            print(f"[EXEC] Búsqueda acústica falló: {e}")
+    for iteration in range(1, MAX_JUDGE_ITERS + 1):
+        print(f"\n{'='*60}")
+        print(f"[JUDGE LOOP] Iteración {iteration}/{MAX_JUDGE_ITERS}")
+        print(f"[JUDGE LOOP] lyric_negative actual: {lyric_negative}")
+        print(f"{'='*60}")
 
-    # ── FUSE ──────────────────────────────────────────────────────────────────
-    if not lyrics_results and not audio_results:
-        return {
-            "error": "Ambas ramas de búsqueda fallaron.",
-            "plan":  plan,
-        }
+        # ── Ejecutar búsqueda ─────────────────────────────────────────────
+        lyrics_results, audio_results, fused = _execute_search(
+            lyric_positive=lyric_positive,
+            lyric_negative=lyric_negative,
+            clap_positive=clap_positive,
+            clap_negative=clap_negative,
+            lyric_weight=lyric_weight,
+            audio_weight=audio_weight,
+            excluded_ids=excluded_ids,
+        )
 
-    fused = compute_hybrid_score(
-        lyrics_results,
-        audio_results,
-        lyric_weight=lyric_weight,
-        audio_weight=audio_weight,
-    )
+        if not fused:
+            print("[JUDGE LOOP] Sin resultados tras filtrar excluidos.")
+            break
+
+        # ── Tomar top-1 y leer letra ──────────────────────────────────────
+        top_song_id, top_score = fused[0]
+        top_meta = engine.get_song_by_id(top_song_id)
+
+        if not top_meta or not top_meta.get("lyrics"):
+            print(f"[JUDGE LOOP] Sin letra para song_id={top_song_id}, saltando.")
+            excluded_ids.add(top_song_id)
+            continue
+
+        print(f"[JUDGE LOOP] Evaluando: {top_meta['title']} — {top_meta['artist']}")
+
+        # ── Llamar al juez ────────────────────────────────────────────────
+        verdict = judge_fn(
+            query=query,
+            lyrics=top_meta["lyrics"],
+            lyric_positive=lyric_positive,
+            lyric_negative=lyric_negative,
+        )
+        verdict["iteration"] = iteration
+        verdict["song_id"]   = top_song_id
+        verdict["title"]     = top_meta["title"]
+        judge_log.append(verdict)
+
+        if verdict["approved"]:
+            print(f"[JUDGE LOOP] ✅ Aprobada en iteración {iteration}")
+            final_verdict = verdict
+            approved_song = top_song_id
+            break
+
+        # ── Rechazada: excluir y reintentar ─────────────────────────────────
+        print(f"[JUDGE LOOP] ❌ Rechazada: {verdict.get('reason', '')}")
+        excluded_ids.add(top_song_id)
+
+    else:
+        # Se agotaron las iteraciones sin aprobación
+        print(f"[JUDGE LOOP] ⚠ Máximo de iteraciones alcanzado sin aprobación.")
 
     # ── BUILD RESPONSE ────────────────────────────────────────────────────────
+    # Re-ejecutar búsqueda final con los negativos actualizados
+    _, _, fused_final = _execute_search(
+        lyric_positive=lyric_positive,
+        lyric_negative=lyric_negative,
+        clap_positive=clap_positive,
+        clap_negative=clap_negative,
+        lyric_weight=lyric_weight,
+        audio_weight=audio_weight,
+        excluded_ids=set(),  # no excluir para el ranking final
+    )
+
+    # Si hay una canción aprobada, ponerla primero
+    if approved_song is not None:
+        fused_final = [
+            (sid, sc) for sid, sc in fused_final if sid == approved_song
+        ] + [
+            (sid, sc) for sid, sc in fused_final if sid != approved_song
+        ]
+
     results = []
-    for song_id, score in fused[:k]:
+    for song_id, score in fused_final[:k]:
         meta = engine.get_song_by_id(song_id)
         if meta:
             meta["score"]     = round(score, 4)
             meta["score_pct"] = round(score * 100, 1)
+            # No enviar la letra completa en el response JSON
+            meta.pop("lyrics", None)
             results.append(meta)
 
     return {
-        "query":        query,
-        "plan":         plan,
-        "results":      results,
-        "lyric_weight": lyric_weight,
-        "audio_weight": audio_weight,
-        "n_lyrics":     len(lyrics_results),
-        "n_audio":      len(audio_results),
+        "query":           query,
+        "plan":            plan,
+        "results":         results,
+        "lyric_weight":    lyric_weight,
+        "audio_weight":    audio_weight,
+        "n_lyrics":        len(lyrics_results),
+        "n_audio":         len(audio_results),
+        "judge_verdict":   final_verdict,
+        "judge_iterations": len(judge_log),
+        "judge_log":       judge_log,
     }
 
 
